@@ -1,0 +1,127 @@
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+from src.config import BRONZE_PATH, SILVER_PATH
+
+
+def load_silver(spark):
+
+    print("Starting Silver layer processing...")
+
+    # Read Bronze Delta table
+    bronze_df = (
+        spark.read
+        .format("delta")
+        .load(str(BRONZE_PATH))
+    )
+
+    # Convert columns into correct data types
+    silver_df = (
+        bronze_df
+        .withColumn(
+            "order_id",
+            F.col("order_id").cast("integer")
+        )
+        .withColumn(
+            "customer_id",
+            F.trim(F.col("customer_id"))
+        )
+        .withColumn(
+            "product",
+            F.trim(F.col("product"))
+        )
+        .withColumn(
+            "category",
+            F.trim(F.col("category"))
+        )
+        .withColumn(
+            "quantity",
+            F.col("quantity").cast("integer")
+        )
+        .withColumn(
+            "unit_price",
+            F.col("unit_price").cast("decimal(12,2)")
+        )
+        .withColumn(
+            "order_date",
+            F.to_date(
+                F.col("order_date"),
+                "yyyy-MM-dd"
+            )
+        )
+        .withColumn(
+            "country",
+            F.trim(F.col("country"))
+        )
+    )
+
+    # Remove records with mandatory fields missing
+    silver_df = silver_df.filter(
+        F.col("order_id").isNotNull()
+        & F.col("order_date").isNotNull()
+        & F.col("customer_id").isNotNull()
+        & F.col("product").isNotNull()
+        & F.col("category").isNotNull()
+        & F.col("quantity").isNotNull()
+        & F.col("unit_price").isNotNull()
+        & F.col("country").isNotNull()
+    )
+
+    # Apply business validation rules
+    silver_df = silver_df.filter(
+        (F.col("quantity") > 0)
+        & (F.col("unit_price") >= 0)
+        & (F.length(F.col("customer_id")) > 0)
+        & (F.length(F.col("product")) > 0)
+    )
+
+    # Remove duplicate orders
+    window_spec = (
+        Window
+        .partitionBy("order_id")
+        .orderBy(
+            F.col("ingestion_timestamp").desc(),
+            F.col("batch_id").desc()
+        )
+    )
+
+    silver_df = (
+        silver_df
+        .withColumn(
+            "row_number",
+            F.row_number().over(window_spec)
+        )
+        .filter(F.col("row_number") == 1)
+        .drop("row_number")
+    )
+
+    # Create calculated sales amount
+    silver_df = silver_df.withColumn(
+        "total_amount",
+        F.round(
+            F.col("quantity") * F.col("unit_price"),
+            2
+        )
+    )
+
+    # Add processing timestamp
+    silver_df = silver_df.withColumn(
+        "silver_processed_timestamp",
+        F.current_timestamp()
+    )
+
+    # Write cleaned data into Silver Delta table
+    (
+        silver_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(str(SILVER_PATH))
+    )
+
+    print("Silver layer completed")
+
+    print("Silver record count:", silver_df.count())
+
+    return silver_df
